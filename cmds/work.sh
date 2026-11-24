@@ -7,9 +7,12 @@
 _work_usage() {
   cat <<'EOF'
 usage: hgt work <n> [--base <ref>] [--no-session] [--no-tmux]
+       hgt work <branch> [--base <ref>] [--no-session] [--no-tmux]
        hgt work rm [<n>] [--force] [--no-switch]
 
-Open (or resume) a local worktree + named Claude session for issue <n>.
+Open (or resume) a local worktree + named Claude session for issue <n>. Given a
+<branch> instead, open one on that branch (new or existing) with claude idle — no
+issue, no plan file, no kickoff prompt.
 
   --base <ref>    base the new worktree here (default: HEAD — supports stacking)
   --no-session    ensure the worktree, don't launch claude
@@ -181,19 +184,17 @@ _prepare_sandbox() {
   for a in "${HGT_SANDBOX_ARGV[@]}"; do _SANDBOX_SQ+="$(_shq "$a") "; done
 }
 
-# launch_session N WT [TMUX] — the launcher seam (spec §4/§5). Default (TMUX=1): run the named
+# launch_session NAME WT [TMUX] [PROMPT] — the launcher seam (spec §4/§5). Default (TMUX=1): run the named
 # claude session inside a *detached* tmux session `<repo>/<n>-<slug>`, then attach/switch to it. The
 # detached session outlives your terminal, so crash-recovery becomes "reattach if it's alive,
 # else recreate" instead of "relaunch from scratch" (see ADR 0003). Resume reuses a live session
 # rather than spawning a second. TMUX=0 (--no-tmux) keeps the Slice 2 inline launch. The tmux
 # session name matches the claude session name so `claude --resume` stays deterministic too.
+# PROMPT empty = launch claude idle, with no kickoff (ad-hoc branch mode, #127).
 launch_session() {
-  local n="$1" wt="$2" use_tmux="${3:-1}"
-  local name; name=$(_session_name "$n" "$wt")
-  # HGT_WORK_PROMPT overrides the kickoff prompt — an internal seam the conformance suite uses to
-  # drive quoting edge-cases (', $, `, newline) through the launcher (issue #25). Local path only,
-  # so a self-set env var crosses no trust boundary.
-  local prompt="${HGT_WORK_PROMPT:-Read .hgt/work/${n}.md and CLAUDE.md, then start on issue #${n}. Commit early and often — every commit is a recovery checkpoint. Open a PR for review; do not merge.}"
+  local name="$1" wt="$2" use_tmux="${3:-1}" prompt="${4:-}"
+  local -a prompt_arg=()
+  [ -z "$prompt" ] || prompt_arg=("$prompt")
 
   # Sandbox seam (#67/#74, ADR 0007): confine claude to the worktree and to an egress allowlist.
   # _prepare_sandbox preflights (fail closed) and populates HGT_SANDBOX_ARGV (the `env -i … srt`
@@ -215,9 +216,9 @@ launch_session() {
         # claude exits — never left open in this shell where `cat /proc/self/fd/3` would reprint the
         # PAT. rm inside: the group's redirect has already opened the fd, so unlinking now leaves the
         # wrapper reading an anonymous inode.
-        { rm -f "$_SANDBOX_ARGS_FILE"; run "${HGT_SANDBOX_ARGV[@]}" claude -n "$name" "$prompt"; } 3<"$_SANDBOX_ARGS_FILE"
+        { rm -f "$_SANDBOX_ARGS_FILE"; run "${HGT_SANDBOX_ARGV[@]}" claude -n "$name" "${prompt_arg[@]}"; } 3<"$_SANDBOX_ARGS_FILE"
       else
-        run "${HGT_SANDBOX_ARGV[@]}" claude -n "$name" "$prompt"
+        run "${HGT_SANDBOX_ARGV[@]}" claude -n "$name" "${prompt_arg[@]}"
       fi
     )
     return
@@ -252,7 +253,8 @@ launch_session() {
     # that. (Verified against real tmux, not just an sh -c parse — see PR #49.)
     _prepare_sandbox "$wt"
     run tmux new-session -d -s "$name" -c "$wt"
-    local launch="${_SANDBOX_SQ}claude -n $(_shq "$name") $(_shq "$prompt")"
+    local launch="${_SANDBOX_SQ}claude -n $(_shq "$name")"
+    [ -z "$prompt" ] || launch+=" $(_shq "$prompt")"
     # #81: with a scoped token, wrap the launch in a command GROUP that opens the payload on fd 3 for
     # the prefix's `sh -c '. /dev/fd/3'` and unlinks it — the `3< <file>` on the group closes the fd
     # when claude exits, so it's never left readable in the pane shell (unlike `exec 3<`). dash-safe.
@@ -361,11 +363,42 @@ cmd_work_rm() {
   info "removed worktree for issue $n (branch left intact)"
 }
 
+# _work_branch BRANCH BASE SESSION TMUX — ad-hoc mode (#127): a worktree + session on a named
+# branch with no issue behind it (e.g. implementing a spec patch). No tracker call, no plan file,
+# and claude starts idle — the human drives. Worktree dir and session are keyed on the slugified
+# branch; a leading digit gets a `b-` prefix so `_find_worktree <n>`'s `<n>-*` glob can't claim it.
+_work_branch() {
+  local branch="$1" base="$2" session="$3" use_tmux="$4" slug wtpath
+  git check-ref-format --branch "$branch" >/dev/null 2>&1 \
+    || die "hgt work: '$branch' is neither an issue number nor a valid branch name"
+  slug=$(slugify "$branch")
+  case "$slug" in [0-9]*) slug="b-$slug" ;; esac
+  wtpath="$(_worktree_base)/$slug"
+  if [ -d "$wtpath" ]; then
+    info "resume: worktree exists at $wtpath"
+  elif git show-ref --verify --quiet "refs/heads/$branch" \
+    || git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    # Existing branch (local, or a remote-tracking ref git DWIMs into one): attach, don't -b.
+    info "attach: worktree $wtpath on existing branch $branch"
+    run git worktree add "$wtpath" "$branch"
+    _carry_worktree_includes "$wtpath"
+  else
+    info "create: worktree $wtpath on $branch (base $base)"
+    run git worktree add -b "$branch" "$wtpath" "$base"
+    _carry_worktree_includes "$wtpath"
+  fi
+  if [ "$session" -eq 1 ]; then
+    launch_session "$(_repo_slug)/$slug" "$wtpath" "$use_tmux"
+  else
+    info "session: skipped (--no-session); worktree ready at $wtpath"
+  fi
+}
+
 cmd_work() {
   case "${1:-}" in
     -h | --help) _work_usage; return 0 ;;
     rm) shift; cmd_work_rm "$@"; return ;;
-    '') die "hgt work: missing issue number (try 'hgt work <n>')" ;;
+    '') die "hgt work: missing issue number or branch (try 'hgt work <n>')" ;;
   esac
 
   local n="" base="HEAD" session=1 use_tmux=1
@@ -382,8 +415,8 @@ cmd_work() {
     esac
     shift
   done
-  [ -n "$n" ] || die "hgt work: missing issue number (try 'hgt work <n>')"
-  case "$n" in *[!0-9]*) die "hgt work: issue must be a number, got '$n'" ;; esac
+  [ -n "$n" ] || die "hgt work: missing issue number or branch (try 'hgt work <n>')"
+  case "$n" in *[!0-9]*) _work_branch "$n" "$base" "$session" "$use_tmux"; return ;; esac
 
   # Resolve the issue through the tracker seam and parse its stable record. number/url/title
   # are single-line `key=` lines; everything after the `---body---` sentinel is the body.
@@ -434,7 +467,10 @@ cmd_work() {
   fi
 
   if [ "$session" -eq 1 ]; then
-    launch_session "$n" "$wtpath" "$use_tmux"
+    # HGT_WORK_PROMPT overrides the kickoff — a test seam for quoting edge-cases (#25). Local
+    # path only, so a self-set env var crosses no trust boundary.
+    launch_session "$(_session_name "$n" "$wtpath")" "$wtpath" "$use_tmux" \
+      "${HGT_WORK_PROMPT:-Read .hgt/work/${n}.md and CLAUDE.md, then start on issue #${n}. Commit early and often — every commit is a recovery checkpoint. Open a PR for review; do not merge.}"
   else
     info "session: skipped (--no-session); worktree ready at $wtpath"
   fi

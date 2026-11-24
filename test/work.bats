@@ -797,3 +797,65 @@ bare_path() {
   [[ "$output" == *"couldn't probe"* ]]
   grep -q '^srt --settings ' "$SHIM_LOG"  # the claude jail launches despite the probe failure
 }
+
+# --- ad-hoc branch mode (#127) ---
+
+@test "work <branch> creates a worktree + branch with no issue lookup and no plan file" {
+  work_env
+  run "$HGT_BIN" work spec/widget-v2 --no-session
+  [ "$status" -eq 0 ]
+  ! grep -q '^gh ' "$SHIM_LOG"
+  grep -q "^git worktree add -b spec/widget-v2 $TMP/wt/spec-widget-v2 HEAD\$" "$SHIM_LOG"
+  [ ! -e "$TMP/wt/spec-widget-v2/.hgt" ]
+  ! grep -q 'commit -m' "$SHIM_LOG"
+}
+
+@test "work <branch> attaches to an existing branch instead of -b" {
+  work_env
+  run env SHIM_GIT_BRANCH_EXISTS=0 "$HGT_BIN" work spec/widget-v2 --no-session
+  [ "$status" -eq 0 ]
+  grep -q "^git worktree add $TMP/wt/spec-widget-v2 spec/widget-v2\$" "$SHIM_LOG"
+  ! grep -q 'worktree add -b' "$SHIM_LOG"
+}
+
+@test "work <branch> launches claude idle: named session, no kickoff prompt" {
+  work_env
+  export SHIM_TMUX_SENDKEYS_FILE="$TMP/keys"
+  run "$HGT_BIN" work spec/widget-v2
+  [ "$status" -eq 0 ]
+  grep -q "^tmux new-session -d -s hgt/spec-widget-v2 -c $TMP/wt/spec-widget-v2\$" "$SHIM_LOG"
+  grep -q "^tmux split-window -h -t hgt/spec-widget-v2" "$SHIM_LOG"
+  # the typed command ends at the session name — no prompt arg
+  grep -q "claude -n 'hgt/spec-widget-v2'\$" "$TMP/keys"
+}
+
+@test "work <branch> --no-tmux launches claude inline with no prompt" {
+  work_env
+  run "$HGT_BIN" work spec/widget-v2 --no-tmux
+  [ "$status" -eq 0 ]
+  grep -q '^claude -n hgt/spec-widget-v2$' "$SHIM_LOG"
+}
+
+@test "work <branch> resumes an existing worktree without a second add" {
+  work_env
+  "$HGT_BIN" work spec/widget-v2 --no-session >/dev/null 2>&1
+  : >"$SHIM_LOG"
+  run "$HGT_BIN" work spec/widget-v2 --no-session
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"resume: worktree exists"* ]]
+  ! grep -q 'worktree add' "$SHIM_LOG"
+}
+
+@test "work <branch> starting with a digit can't collide with issue worktrees" {
+  work_env
+  run "$HGT_BIN" work 2026-spec --no-session
+  [ "$status" -eq 0 ]
+  grep -q "^git worktree add -b 2026-spec $TMP/wt/b-2026-spec HEAD\$" "$SHIM_LOG"
+}
+
+@test "work rejects an invalid branch name" {
+  work_env
+  run env SHIM_GIT_EXIT=1 "$HGT_BIN" work 'bad..name' --no-session
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"neither an issue number nor a valid branch name"* ]]
+}
