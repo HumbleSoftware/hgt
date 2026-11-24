@@ -125,6 +125,7 @@ early and often so every commit is a recovery checkpoint.
 hgt init                 # idempotent scaffold of hgt into a new/existing repo
 hgt issue ...            # manage the issue queue (create, list, show, ready)
 hgt work <n>             # local execution: worktree + Claude session for issue <n>
+hgt work <branch>        # same, ad hoc on a new/existing branch; claude starts idle
 ```
 
 - **`hgt init`** drops a lean `CLAUDE.md` and gated, least-privilege workflow file(s),
