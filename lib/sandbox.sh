@@ -35,6 +35,8 @@ _SANDBOX_RW_DEPS='.claude .claude.json'
 # 0005's allowlist by invoking srt from an `env -i` baseline. PATH is load-bearing twice over:
 # `env -i` resolves `srt` itself through the PATH it sets. Extend via HGT_SANDBOX_SETENV.
 _SANDBOX_ENV_PASS='HOME USER LOGNAME PATH TERM LANG LC_ALL LC_CTYPE'
+# Where to look for Ubuntu's stock bwrap profile. HGT_SANDBOX_AA_DIR overrides (the suite fakes it).
+_SANDBOX_AA_DIR="${HGT_SANDBOX_AA_DIR:-/etc/apparmor.d}"
 
 # sandbox_enabled — is the jail in force? On by default (fail closed); HGT_NO_SANDBOX=1 or the
 # --no-sandbox flag (which sets it) is the explicit opt-out.
@@ -52,6 +54,25 @@ sandbox_enabled() { [ "${HGT_NO_SANDBOX:-0}" != 1 ]; }
 _sandbox_userns_ok() {
   bwrap --unshare-user --ro-bind /usr /usr --ro-bind-try /lib /lib --ro-bind-try /lib64 /lib64 \
     /usr/bin/true 2>/dev/null
+}
+
+# _sandbox_aa_strips_caps — is Ubuntu's stock bwrap profile in force? It runs everything bwrap
+# spawns under `unpriv_bwrap` (`audit deny capability`), so srt's apply-seccomp helper never gets
+# the CAP_SYS_ADMIN it needs and every launch dies (anthropics/sandbox-runtime#429).
+_sandbox_aa_strips_caps() {
+  [ -e "$_SANDBOX_AA_DIR/bwrap-userns-restrict" ] && [ ! -e "$_SANDBOX_AA_DIR/disable/bwrap-userns-restrict" ]
+}
+
+# _sandbox_bridge_dir WT — a short private dir for srt's proxy bridge sockets, which it binds in
+# os.tmpdir(): the jail can't see /tmp, and a worktree-deep path blows the 107-byte AF_UNIX limit.
+# Per worktree, so it's reused across launches rather than leaked. Sets _SANDBOX_BRIDGE.
+_sandbox_bridge_dir() {
+  local sum; sum=$(printf '%s' "$1" | cksum); sum=${sum%% *}
+  _SANDBOX_BRIDGE="${XDG_RUNTIME_DIR:-/tmp}/hgt-$(id -u)-$sum"
+  mkdir -p -m 700 "$_SANDBOX_BRIDGE" 2>/dev/null || true
+  # Under /tmp another user could pre-create it; never bridge through a dir that isn't ours.
+  [ -d "$_SANDBOX_BRIDGE" ] && [ ! -L "$_SANDBOX_BRIDGE" ] && [ -O "$_SANDBOX_BRIDGE" ] \
+    || die "sandbox: $_SANDBOX_BRIDGE isn't a private dir owned by $(id -un) — refusing to bridge the proxy through it"
 }
 
 # _sandbox_srt_version — the installed SRT's version, or nothing if it can't be determined.
@@ -174,6 +195,29 @@ _sandbox_settings() {
   # _sandbox_extant-filtered: `tmux new-session` creates /tmp/tmux-<uid> *after* this file is
   # written, and SRT drops an absent deny at its own launch.
   deny_read+=("/tmp/tmux-$uid" "/run/user/$uid")
+  # On Linux, hide every tree this host keeps sockets in (D-Bus, systemd, snapd, X11, tmux, ...).
+  # srt's own AF_UNIX block, the apply-seccomp helper, can't run under Ubuntu's stock bwrap profile,
+  # so these denies are the socket boundary there; elsewhere they back the filter up.
+  local allow_unix=false
+  _SANDBOX_BRIDGE=
+  if [ "$(uname -s)" = Linux ]; then
+    deny_read+=(/home /run /tmp /var/lib /var/snap /var/tmp /mnt/wslg)
+    # ...but not what the jail needs from under them: DNS config (resolv.conf links into /run on
+    # systemd-resolved hosts) and PATH dirs (NixOS's profile is /run/current-system). Never the
+    # per-user runtime dir or a temp tree, which is where the sockets are.
+    local -a path_dirs need=()
+    IFS=: read -ra path_dirs <<<"$PATH"
+    for p in "$(readlink -f /etc/resolv.conf)" "${path_dirs[@]}"; do
+      case "$p" in
+        /run/user/* | /tmp/* | /var/tmp/*) ;;
+        /run/* | /var/lib/* | /var/snap/*) need+=("$p") ;;
+      esac
+    done
+    while IFS= read -r p; do allow_read+=("$p"); done < <(_sandbox_extant "${need[@]}")
+    _sandbox_bridge_dir "$wt"
+    allow_read+=("$_SANDBOX_BRIDGE")
+    _sandbox_aa_strips_caps && allow_unix=true
+  fi
 
   # The jail can rewrite this file, so deny it explicitly; regenerating each launch isn't enough
   # on its own. Narrowing the .git write grant itself is #75.
@@ -186,8 +230,10 @@ _sandbox_settings() {
     printf '    "deniedDomains": [],\n'
     # Without this an unlisted host consults an ask-callback, which in a detached pane either hangs
     # or auto-allows.
-    printf '    "strictAllowlist": true\n'
-    printf '  },\n'
+    printf '    "strictAllowlist": true'
+    # Skips apply-seccomp, the only way srt runs at all under that profile; the denies above stand in.
+    "$allow_unix" && printf ',\n    "allowAllUnixSockets": true'
+    printf '\n  },\n'
     printf '  "filesystem": {\n'
     printf '    "denyRead": %s,\n'   "$(_json_arr "${deny_read[@]}")"
     printf '    "allowRead": %s,\n'  "$(_json_arr "${allow_read[@]}")"
@@ -216,14 +262,15 @@ sandbox_argv() {
   for var in $_SANDBOX_ENV_PASS ${HGT_SANDBOX_SETENV:-}; do
     [ -n "${!var:-}" ] && HGT_SANDBOX_ARGV+=("$var=${!var}")
   done
-  # srt must see no TMPDIR: it binds bridge sockets under os.tmpdir(), and a worktree-deep
-  # path blows the 107-byte AF_UNIX limit.
+  # srt binds bridge sockets under os.tmpdir(), so it sees no TMPDIR (a worktree-deep path blows
+  # the 107-byte AF_UNIX limit) or, on Linux, the short private dir _sandbox_bridge_dir made.
   # CLAUDE_CODE_TMPDIR moves only the jail's TMPDIR — into the scratch dir, already writable
   # and private to this worktree rather than shared with every other jail on the box.
   # Without GH_CONFIG_DIR gh reaches for the real ~/.config/gh — the admin credential this
   # jail exists to keep away from the agent. A sibling of the scratch, not inside it: a
   # tmp-cleaner in the jail must not clobber gh config mid-session.
   HGT_SANDBOX_ARGV+=("CLAUDE_CODE_TMPDIR=$_SANDBOX_SCRATCH" "GH_CONFIG_DIR=$wt/.hgt/gh")
+  [ -n "$_SANDBOX_BRIDGE" ] && HGT_SANDBOX_ARGV+=("TMPDIR=$_SANDBOX_BRIDGE")
 
   # git config injected via the numbered GIT_CONFIG_* env (no ~/.gitconfig write needed). Always
   # force gpg-signing off — the jail has no ~/.gnupg, so the agent can't sign as the human. Always
