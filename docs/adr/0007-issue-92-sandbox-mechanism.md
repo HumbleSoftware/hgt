@@ -129,6 +129,18 @@ shell does reach the jail without it, and SRT ships no default `unsetEnvVars`.
   exist and sit inside `allowWrite` (SRT's default `/tmp/claude` shows why: never created on
   Linux, and extant-only binding silently skips it, leaving the jail's `/tmp` read-only).
 
+## Amendment — what #74 settled (0.0.67)
+
+- **`allowedDomains` is derived, not fixed:** `api.anthropic.com` + `platform.claude.com` + the
+  host of the worktree's `origin` + `HGT_SANDBOX_EGRESS_ALLOW`. `api.github.com` rides along only
+  when the host is exactly `github.com`; GHE serves `/api/v3` in-host, so no `api.` sibling is
+  invented. A remote that doesn't parse to `[A-Za-z0-9.-]+` (local path, `file://`, IPv6 literal)
+  contributes nothing — SRT rejects a pattern with `:` and the launch would die.
+- **claude's own hosts were read off the 2.1.x binary, not measured on a live run.** The OAuth
+  refresh endpoint is `platform.claude.com/v1/oauth/token`; without it a subscription login
+  expires mid-session. Telemetry (datadog intake et al.) is denied on purpose. If an attended run
+  shows something else claude can't live without, it belongs in `_SANDBOX_CLAUDE_DOMAINS`.
+
 ## Consequences / residuals
 
 - **Pre-1.0 dependency.** `0.0.67`, "research preview," config format may evolve. Pin an exact

@@ -151,11 +151,13 @@ hgt work <branch>        # same, ad hoc on a new/existing branch; claude starts 
     and a mismatch fails closed with the install command (`HGT_SANDBOX_SRT_VERSION=` skips the
     check). On Ubuntu 24.04+ install the one-time AppArmor profile first; the preflight prints
     how. Every missing piece dies with its own remediation rather than launching unconfined.
-  - **Egress:** SRT's jail always drops the net namespace, so hgt has to name the hosts the
-    agent may reach. Today that's a fixed list (the Anthropic API and GitHub); deriving it from
-    the worktree's own remote is [#74](https://github.com/cesutherland/hgt/issues/74).
-  - **Seams:** `HGT_SANDBOX_SETENV` (extra env vars into the jail) and `HGT_SANDBOX_RO_BIND`
-    (extra readable paths), both space-separated. Reach for these before widening the defaults.
+  - **Egress:** SRT's jail always drops the net namespace, so hgt names the hosts the agent
+    may reach: the Anthropic API, claude's OAuth refresh host (`platform.claude.com`), and the
+    host of the worktree's `origin` remote (plus `api.github.com` when that's `github.com`).
+    Nothing else — not npm, not telemetry.
+  - **Seams:** `HGT_SANDBOX_SETENV` (extra env vars into the jail), `HGT_SANDBOX_RO_BIND`
+    (extra readable paths) and `HGT_SANDBOX_EGRESS_ALLOW` (extra hosts, SRT patterns like
+    `*.npmjs.org` allowed), all space-separated. Reach for these before widening the defaults.
   - **Publish boundary (issue #81):** by default the jail holds **no push credential**, so
     the agent's commits dead-end locally. Set `HGT_SANDBOX_GITHUB_TOKEN` to a scoped
     machine-user PAT and the jail gains a credentialed push/PR path (`git@`→https, plus a git
@@ -163,7 +165,6 @@ hgt work <branch>        # same, ad hoc on a new/existing branch; claude starts 
     runs. The token is delivered as an environment variable **into** the jail by sourcing an
     unlinked file descriptor, so its value never touches the argv, the command echo, the tmux
     pane, or `/proc/<pid>/cmdline`, and it dies with the process (no persistent on-disk secret).
-    **Precondition:** a token usable in the jail wants egress locked down (issue #74).
   - **Known friction:** jail writes are deny-by-default (allowed: worktree + git dir). The jail's
     `TMPDIR` is the worktree's own scratch dir (`.hgt/tmp`), so `mktemp` and friends work —
     and each jail's tmp is private to it; a tool that hardcodes `/tmp` will fail.
