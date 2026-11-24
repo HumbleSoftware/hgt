@@ -10,6 +10,9 @@ setup() {
   SHIM_LOG="$TMP/shim.log"
   : >"$SHIM_LOG"
   export SHIM_LOG
+  # hgt makes the jail's proxy bridge dir under XDG_RUNTIME_DIR: keep it off the developer's box.
+  export XDG_RUNTIME_DIR="$TMP/run"
+  mkdir -p "$XDG_RUNTIME_DIR"
   export PATH="$HGT_REPO/test/shims:$PATH"
   cd "$TMP"
 }
