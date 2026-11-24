@@ -20,9 +20,11 @@
 # HGT_SANDBOX_SRT_VERSION overrides; empty skips the check.
 _SANDBOX_SRT_VERSION="${HGT_SANDBOX_SRT_VERSION-0.0.67}"
 
-# `network` is a required settings key and SRT always drops the net namespace, so there is no
-# unrestricted mode to defer with. Placeholder until #74 derives it.
-_SANDBOX_ALLOWED_DOMAINS='api.anthropic.com github.com api.github.com'
+# What claude itself needs, whatever the repo: the API, and the OAuth token refresh
+# (platform.claude.com/v1/oauth/token) — without it a subscription login dies at expiry mid-session.
+# Telemetry hosts are deliberately absent; claude tolerates them failing. The forge comes from the
+# worktree's remote (_sandbox_allowed_domains); extend via HGT_SANDBOX_EGRESS_ALLOW.
+_SANDBOX_CLAUDE_DOMAINS='api.anthropic.com platform.claude.com'
 
 # Runtime deps under $HOME re-allowed for reading over the blanket `denyRead: [$HOME]`.
 # Machine-specific (node via nvm, the claude launcher under ~/.local), so extend via
@@ -133,6 +135,46 @@ sandbox_preflight() {
   fi
 }
 
+# _sandbox_remote_host WT — the bare host of the worktree's origin remote, or nothing. Nothing is
+# the safe failure: SRT rejects a malformed pattern (anything with `:`) and kills the launch, so a
+# local path, file:// or IPv6 literal contributes no domain rather than a broken one.
+_sandbox_remote_host() {
+  local url h
+  url=$(git -C "$1" remote get-url origin 2>/dev/null) || return 0
+  case "$url" in
+    *://*)
+      case "$url" in https://* | http://* | ssh://* | git://*) ;; *) return 0 ;; esac
+      # Authority first, then userinfo, then port: stripping `*@` off the whole URL would let
+      # https://host/a@b/c.git parse as `b`.
+      h=${url#*://}; h=${h%%/*}; h=${h##*@}; h=${h%:*} ;;
+    *:*)
+      # scp-style user@host:path — but only if the colon precedes any slash (./a:b is a path).
+      h=${url%%:*}
+      case "$h" in */*) return 0 ;; esac
+      h=${h##*@} ;;
+    *) return 0 ;;
+  esac
+  case "$h" in '' | *[!A-Za-z0-9.-]*) return 0 ;; esac
+  printf '%s\n' "$h"
+}
+
+# _sandbox_allowed_domains WT — claude's own hosts, the worktree's forge, then the operator's
+# extras, deduped. github.com is the one forge whose API lives on a sibling name (`gh pr create`
+# needs api.github.com); GHE serves /api/v3 off the same host, so no `api.` is invented generally.
+_sandbox_allowed_domains() {
+  local host d seen=" "
+  local -a all
+  host=$(_sandbox_remote_host "$1")
+  [ "$host" = github.com ] && host="$host api.github.com"
+  # read -a, not an unquoted expansion: an extra like `*.npmjs.org` must not glob against $PWD.
+  read -ra all <<<"$_SANDBOX_CLAUDE_DOMAINS $host ${HGT_SANDBOX_EGRESS_ALLOW:-}"
+  for d in "${all[@]}"; do
+    case "$seen" in *" $d "*) continue ;; esac
+    seen="$seen$d "
+    printf '%s\n' "$d"
+  done
+}
+
 # _json_str VALUE / _json_arr [VALUE...] — JSON string / array of strings. Only \ and " need
 # escaping: every value we emit is a filesystem path or a hostname.
 _json_str() {
@@ -221,12 +263,13 @@ _sandbox_settings() {
 
   # The jail can rewrite this file, so deny it explicitly; regenerating each launch isn't enough
   # on its own. Narrowing the .git write grant itself is #75.
-  local -a deny_write=("$_SANDBOX_SETTINGS_FILE")
+  local -a deny_write=("$_SANDBOX_SETTINGS_FILE") domains=()
+  while IFS= read -r p; do domains+=("$p"); done < <(_sandbox_allowed_domains "$wt")
 
   {
     printf '{\n'
     printf '  "network": {\n'
-    printf '    "allowedDomains": %s,\n' "$(_json_arr $_SANDBOX_ALLOWED_DOMAINS)"
+    printf '    "allowedDomains": %s,\n' "$(_json_arr "${domains[@]}")"
     printf '    "deniedDomains": [],\n'
     # Without this an unlisted host consults an ask-callback, which in a detached pane either hangs
     # or auto-allows.

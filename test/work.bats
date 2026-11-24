@@ -492,9 +492,8 @@ bare_path() {
   [[ "$cfg" == *"\"allowWrite\": [\"$wt\",\"$wt/.git\",\"$HOME/.claude\",\"$HOME/.claude.json\"]"* ]]
   # git identity is readable, so commits carry the human's name without a writable ~/.gitconfig
   [[ "$cfg" == *"\"$HOME/.gitconfig\""* ]]
-  # SRT always drops the net namespace and requires a network block, so the swap can't be
-  # network-neutral. This fixed list is a placeholder — deriving it belongs to #74.
-  [[ "$cfg" == *'"allowedDomains": ["api.anthropic.com","github.com","api.github.com"]'* ]]
+  # claude's own hosts + the forge derived from origin (github.com, whose API is a sibling name)
+  [[ "$cfg" == *'"allowedDomains": ["api.anthropic.com","platform.claude.com","github.com","api.github.com"]'* ]]
   [[ "$cfg" == *'"strictAllowlist": true'* ]]
   # gpg-signing forced off inside — the agent has no ~/.gnupg, can't sign as the human
   grep -q '^srt-env GIT_CONFIG_KEY_0=commit.gpgsign$' "$SHIM_LOG"
@@ -542,6 +541,46 @@ bare_path() {
   grep -q "^srt-env CLAUDE_CODE_TMPDIR=$TMP/wt/5-add-widget/.hgt/tmp\$" "$SHIM_LOG"
   # gh gets a scratch config dir rather than reaching for the admin one the jail exists to hide
   grep -q "^srt-env GH_CONFIG_DIR=$TMP/wt/5-add-widget/.hgt/gh\$" "$SHIM_LOG"
+}
+
+# egress_for URL — the allowedDomains line generated for a fresh worktree whose origin is URL.
+egress_for() {
+  rm -rf "$TMP/wt"
+  SHIM_GIT_REMOTE_URL="$1" "$HGT_BIN" work 5 --no-tmux >/dev/null 2>&1
+  srt_cfg | grep '"allowedDomains"'
+}
+
+@test "sandbox: egress derives the forge from the worktree's remote, not a hardcoded GitHub" {
+  local claude='"api.anthropic.com","platform.claude.com"'
+  work_env
+  # another forge gets itself, and no GitHub; no invented api. sibling (GHE serves /api/v3 in-host)
+  run egress_for https://gitlab.example.com/o/r.git
+  [[ "$output" == *"[$claude,\"gitlab.example.com\"]"* ]]
+  # userinfo AND port stripped, authority cut first — /a@b in the path must not become the host
+  run egress_for https://x-access-token:s3cret@ghe.example.com:8443/a@b/c.git
+  [[ "$output" == *"[$claude,\"ghe.example.com\"]"* ]]
+  [[ "$output" != *s3cret* ]]
+  run egress_for ssh://git@git.example.com:2222/o/r.git
+  [[ "$output" == *"[$claude,\"git.example.com\"]"* ]]
+  run egress_for git@github.com:o/r.git
+  [[ "$output" == *"[$claude,\"github.com\",\"api.github.com\"]"* ]]
+}
+
+@test "sandbox: an unparseable or absent remote contributes nothing rather than a pattern SRT rejects" {
+  local u
+  work_env
+  for u in /srv/git/r.git file:///srv/git/r.git 'https://[::1]:8443/r.git' ./odd:path ''; do
+    run egress_for "$u"
+    [[ "$output" == *'"allowedDomains": ["api.anthropic.com","platform.claude.com"],'* ]] \
+      || { echo "remote '$u' -> $output"; false; }
+  done
+}
+
+@test "sandbox: HGT_SANDBOX_EGRESS_ALLOW extends the egress list, deduped, unglobbed" {
+  work_env
+  : >"$TMP/registry.npmjs.org"  # $PWD is $TMP: a glob that would match if expanded unquoted
+  HGT_SANDBOX_EGRESS_ALLOW='*.npmjs.org github.com' run egress_for https://github.com/o/r.git
+  [[ "$output" == *'["api.anthropic.com","platform.claude.com","github.com","api.github.com","*.npmjs.org"]'* ]]
 }
 
 @test "sandbox: HGT_SANDBOX_RO_BIND extends the readable paths (dogfooding seam)" {
