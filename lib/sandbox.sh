@@ -201,7 +201,19 @@ _sandbox_settings() {
   local allow_unix=false
   _SANDBOX_BRIDGE=
   if [ "$(uname -s)" = Linux ]; then
-    deny_read+=(/run /tmp /var/lib /var/snap)
+    deny_read+=(/home /run /tmp /var/lib /var/snap /var/tmp /mnt/wslg)
+    # ...but not what the jail needs from under them: DNS config (resolv.conf links into /run on
+    # systemd-resolved hosts) and PATH dirs (NixOS's profile is /run/current-system). Never the
+    # per-user runtime dir or a temp tree, which is where the sockets are.
+    local -a path_dirs need=()
+    IFS=: read -ra path_dirs <<<"$PATH"
+    for p in "$(readlink -f /etc/resolv.conf)" "${path_dirs[@]}"; do
+      case "$p" in
+        /run/user/* | /tmp/* | /var/tmp/*) ;;
+        /run/* | /var/lib/* | /var/snap/*) need+=("$p") ;;
+      esac
+    done
+    while IFS= read -r p; do allow_read+=("$p"); done < <(_sandbox_extant "${need[@]}")
     _sandbox_bridge_dir "$wt"
     allow_read+=("$_SANDBOX_BRIDGE")
     _sandbox_aa_strips_caps && allow_unix=true

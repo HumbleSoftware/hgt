@@ -652,7 +652,7 @@ bare_path() {
   local cfg; cfg=$(srt_cfg)
   # D-Bus, systemd, snapd, X11, tmux, postgres, incus: every socket on a stock Ubuntu box lives
   # under one of these, so path-hiding blocks connect() even when srt's seccomp filter can't run
-  [[ "$cfg" == *'"/run","/tmp","/var/lib","/var/snap"'* ]]
+  [[ "$cfg" == *'"/home","/run","/tmp","/var/lib","/var/snap","/var/tmp","/mnt/wslg"'* ]]
   # srt binds its bridge sockets in its TMPDIR — short, private, and re-allowed into the jail
   local bridge; bridge=$(sed -n 's/^srt-env TMPDIR=//p' "$SHIM_LOG")
   [[ "$bridge" == "$XDG_RUNTIME_DIR/hgt-$(id -u)-"* ]]
@@ -660,6 +660,23 @@ bare_path() {
   [[ "$cfg" == *"\"$bridge\""* ]]
   # without Ubuntu's stock bwrap profile, srt's own Unix-socket filter stays on
   [[ "$cfg" != *allowAllUnixSockets* ]]
+}
+
+@test "sandbox: on Linux the jail keeps its DNS config and PATH dirs from under the hidden trees" {
+  [ "$(uname -s)" = Linux ] || skip "Linux-only hiding"
+  [ -d /run/lock ] || skip "no /run/lock to stand in for /run/current-system"
+  work_env
+  local uid; uid=$(id -u)
+  mkdir -p "$XDG_RUNTIME_DIR/bin"
+  PATH="/run/lock:/run/user/$uid:$XDG_RUNTIME_DIR/bin:$PATH" run "$HGT_BIN" work 5 --no-tmux
+  [ "$status" -eq 0 ]
+  local allow resolv; allow=$(srt_cfg | grep '"allowRead"')
+  [[ "$allow" == *'"/run/lock"'* ]]
+  # a PATH entry is no way to re-expose the per-user runtime dir or a temp tree
+  [[ "$allow" != *"\"/run/user/$uid\""* ]]
+  [[ "$allow" != *"\"$XDG_RUNTIME_DIR/bin\""* ]]
+  resolv=$(readlink -f /etc/resolv.conf)
+  case "$resolv" in /run/*) [[ "$allow" == *"\"$resolv\""* ]] ;; esac
 }
 
 @test "sandbox: under Ubuntu's stock bwrap profile, srt's seccomp helper is skipped (sandbox-runtime#429)" {
